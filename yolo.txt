@@ -1,0 +1,229 @@
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+from ultralytics import YOLO
+import torch
+
+DATA_YAML  = r'D:\CV_Projects\Trafik_Bitirme\dataset\data.yaml'
+MODEL_SIZE = 'yolov8m.pt'
+EPOCHS     = 100
+IMG_SIZE   = 960
+BATCH_SIZE = 4
+PROJECT    = 'runs/train'
+RUN_NAME   = 'traffic_v11'
+
+def main():
+    torch.cuda.empty_cache()
+    model = YOLO(MODEL_SIZE)
+
+    results = model.train(
+        data          = DATA_YAML,
+        epochs        = EPOCHS,
+        imgsz         = IMG_SIZE,
+        batch         = BATCH_SIZE,
+        nbs           = 16,
+        workers       = 0,
+        amp           = True,
+        cache         = 'disk',
+        project       = PROJECT,
+        name          = RUN_NAME,
+        exist_ok      = True,
+        device        = 0,
+        # Augmentation
+        hsv_h         = 0.015,
+        hsv_s         = 0.5,
+        hsv_v         = 0.4,
+        degrees       = 10.0,
+        scale         = 0.5,
+        mosaic        = 1.0,
+        close_mosaic  = 10,
+        mixup         = 0.0,
+        copy_paste    = 0.0,
+        fliplr        = 0.0,
+        flipud        = 0.0,
+        # Loss
+        box           = 7.5,
+        cls           = 1.5,
+        # Optimization
+        lr0           = 0.01,
+        lrf           = 0.01,
+        cos_lr        = True,
+        warmup_epochs = 5,
+        patience      = 50,
+        deterministic = True,
+        seed          = 42,
+        # Saving
+        save          = True,
+        save_period   = 5,
+        plots         = True,
+        verbose       = True,
+    )
+
+    print("\n" + "=" * 50)
+    print("Training complete!")
+    print(f"Best weights: {results.save_dir}/weights/best.pt")
+    print("=" * 50)
+
+if __name__ == '__main__':
+    main()
+
+
+
+/*******************
+import cv2
+import requests
+import threading
+import time
+import torch
+from ultralytics import YOLO
+
+# CONFIG 
+MODEL_PATH  = r'D:\CV_Projects\runs\detect\runs\train\traffic_v11\weights\best.pt'
+ESP32_IP    = 'http://10.27.99.141'
+ESP32_URL   = f'{ESP32_IP}:81/stream'
+
+CLASS_CONF = {
+    0: 0.15,  # Green_Light
+    1: 0.25,  # Red_Light
+    2: 0.65,  # Right_Turn
+    3: 0.65,  # Left_Turn
+}
+
+COMMANDS = {
+    'Green_Light': 'F',
+    'Red_Light'  : 'S',
+    'Right_Turn' : 'R',
+    'Left_Turn'  : 'L',
+}
+
+CLASS_COLORS = {
+    'Green_Light': (  0, 255,   0),
+    'Red_Light'  : (  0,   0, 255),
+    'Right_Turn' : (  0, 165, 255),
+    'Left_Turn'  : (255,   0, 255),
+}
+
+def send_command(cmd):
+    try:
+        requests.post(f'{ESP32_IP}/motor', data=cmd, timeout=0.5)
+    except Exception as e:
+        print(f"Send error: {e}")
+
+class ESP32Stream:
+    def __init__(self, url):
+        self.url     = url
+        self.frame   = None
+        self.lock    = threading.Lock()
+        self.running = True
+        self.thread  = threading.Thread(target=self._grab, daemon=True)
+        self.thread.start()
+
+    def _grab(self):
+        while self.running:
+            cap = cv2.VideoCapture(self.url)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            while self.running:
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.frame = frame
+                else:
+                    print("Stream lost — reconnecting...")
+                    break
+            cap.release()
+            time.sleep(1)
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+    def stop(self):
+        self.running = False
+
+def draw_box(frame, x1, y1, x2, y2, label, color):
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+    cv2.putText(frame, label, (x1 + 2, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+def draw_hud(frame, det_count, last_cmd):
+    hud = f"Detections:{det_count}  CMD:{last_cmd}"
+    cv2.putText(frame, hud, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+    cv2.putText(frame, hud, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+def main():
+    model = YOLO(MODEL_PATH)
+
+    if torch.cuda.is_available():
+        model.to('cuda')
+        print("Using GPU")
+    else:
+        print("Using CPU")
+
+    class_names = model.names
+    print("Model classes:", class_names)
+
+    stream = ESP32Stream(ESP32_URL)
+    print(f"Connecting to stream: {ESP32_URL}")
+
+    print("Waiting for first frame...")
+    while stream.read() is None:
+        time.sleep(0.1)
+    print("Stream connected!")
+
+    last_command = None
+
+    while True:
+        frame = stream.read()
+        if frame is None:
+            continue
+
+        results = model(frame, conf=0.10, verbose=False)[0]
+
+        command   = None
+        best_conf = 0.0
+
+        for box in results.boxes:
+            conf     = float(box.conf[0])
+            class_id = int(box.cls[0])
+            name     = class_names.get(class_id, '')
+
+            if name not in COMMANDS:
+                continue
+
+            min_conf = CLASS_CONF.get(class_id, 0.25)
+
+            if conf >= min_conf and conf > best_conf:
+                best_conf = conf
+                command   = name
+
+            if conf >= min_conf:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                label = f"{name} {conf:.2f}"
+                color = CLASS_COLORS.get(name, (255, 255, 255))
+                draw_box(frame, x1, y1, x2, y2, label, color)
+
+        if command is not None:
+            serial_cmd = COMMANDS.get(command, '')
+            if serial_cmd and serial_cmd != last_command:
+                send_command(serial_cmd)
+                print(f"Sent: {serial_cmd} ({command} conf:{best_conf:.2f})")
+                last_command = serial_cmd
+
+        draw_hud(frame, len(results.boxes), last_command or 'none')
+
+        cv2.imshow("ESP32-CAM Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    stream.stop()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
